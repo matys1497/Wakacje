@@ -560,6 +560,16 @@ function App() {
                 ethBy[p.p] = (ethBy[p.p] || 0) + ((p.ml * abv) / 100) * ETHANOL_G_PER_ML;
         }
         const owed = {}, paid = {}, zapasBy = {};
+        // Kto komu — zanim długi zwiniemy w najmniejszą liczbę przelewów.
+        // Dług zawsze idzie do kupującego tę konkretną butelkę; własna konsumpcja
+        // z własnej butelki nie jest długiem wobec nikogo.
+        const dlugi = {};
+        const dodajDlug = (od, doKogo, v) => {
+            if (!doKogo || od === doKogo || !(v > 0))
+                return;
+            dlugi[od] = dlugi[od] || {};
+            dlugi[od][doKogo] = (dlugi[od][doKogo] || 0) + v;
+        };
         for (const p of people) {
             owed[p.id] = 0;
             paid[p.id] = 0;
@@ -596,6 +606,7 @@ function App() {
                     if (owed[k] !== undefined) {
                         owed[k] += szt[k] * zaSztuke;
                         przydzielone += szt[k] * zaSztuke;
+                        dodajDlug(k, kupujacy, szt[k] * zaSztuke);
                     }
                 wypite += przydzielone;
                 const reszta = price - przydzielone;
@@ -617,6 +628,7 @@ function App() {
                 if (owed[k] !== undefined) {
                     owed[k] += per[k] * perMl;
                     przydzielone += per[k] * perMl;
+                    dodajDlug(k, kupujacy, per[k] * perMl);
                 }
             wypite += przydzielone;
             mlZostalo += Math.max(0, vol - total);
@@ -637,12 +649,16 @@ function App() {
             }
             else if (tryb === "pijacy") {
                 for (const k of Object.keys(per))
-                    if (owed[k] !== undefined)
+                    if (owed[k] !== undefined) {
                         owed[k] += (per[k] / total) * reszta;
+                        dodajDlug(k, kupujacy, (per[k] / total) * reszta);
+                    }
             }
             else if (people.length) {
-                for (const p of people)
+                for (const p of people) {
                     owed[p.id] += reszta / people.length;
+                    dodajDlug(p.id, kupujacy, reszta / people.length);
+                }
             }
         }
         const totalMl = Object.values(mlBy).reduce((a, c) => a + c, 0);
@@ -684,6 +700,23 @@ function App() {
             if (cred[j].v <= 0.01)
                 j++;
         }
+        // Druga lektura tych samych pieniędzy: bez skracania długów, pogrupowana
+        // po tym, czyj alkohol się piło. Więcej przelewów, za to widać powód każdego.
+        const nazwa = (id) => (people.find((x) => x.id === id) || {}).name || "?";
+        const wgWierzyciela = {};
+        for (const od of Object.keys(dlugi))
+            for (const doKogo of Object.keys(dlugi[od])) {
+                const v = dlugi[od][doKogo];
+                if (!(v > 0.01))
+                    continue;
+                (wgWierzyciela[doKogo] = wgWierzyciela[doKogo] || [])
+                    .push({ from: nazwa(od), fromId: od, to: nazwa(doKogo), toId: doKogo, v });
+            }
+        const wprost = Object.keys(wgWierzyciela).map((id) => ({
+            id, name: nazwa(id),
+            lista: wgWierzyciela[id].sort((a, b) => b.v - a.v),
+            suma: wgWierzyciela[id].reduce((a, c) => a + c.v, 0),
+        })).sort((a, b) => b.suma - a.suma);
         const unknownAbv = bottles.some((b) => !(Number(b.abv) > 0)) && pours.length > 0;
         // Ile alkoholu nadal jest alkoholem. Liczone z faktycznej konsumpcji, nie
         // z sumy rachunków — w trybach „cała grupa" i „kto z niej pił" rachunki
@@ -707,7 +740,7 @@ function App() {
         if (Math.abs(bilans) > 0.01)
             ostrzezenia.push("Salda nie schodzą się do zera (różnica " + zl(bilans)
                 + "). Sprawdź ceny i kupujących, bo część rozliczenia przepada.");
-        return { rows, spend, wypite, totalMl, totalKreski, totalSztuki, totalEth, transfers, mlByBottle, sztukiByBottle, unknownAbv, nierozliczone, zapasSztuk, mlZostalo, ostrzezenia };
+        return { rows, spend, wypite, wprost, totalMl, totalKreski, totalSztuki, totalEth, transfers, mlByBottle, sztukiByBottle, unknownAbv, nierozliczone, zapasSztuk, mlZostalo, ostrzezenia };
     }, [pours, people, bottles, state.mode]);
     if (!CONFIGURED)
         return React.createElement(Setup, null);
@@ -1247,10 +1280,12 @@ function Line({ k, v, color }) {
 }
 /* ---------- zakładka: rozliczenie ---------- */
 function Rozliczenie({ calc, mode, setMode, colorOf, room, pours, resetPours }) {
-    const { rows, spend, wypite, totalKreski, totalSztuki, transfers, nierozliczone, zapasSztuk, mlZostalo, ostrzezenia } = calc;
+    const { rows, spend, wypite, wprost, totalKreski, totalSztuki, transfers, nierozliczone, zapasSztuk, mlZostalo, ostrzezenia } = calc;
     const tryb = trybReszty(mode);
     const [copied, setCopied] = useState(false);
     const [confirm, setConfirm] = useState(false);
+    const [widok, setWidok] = useState(() => lsGet("kreski:widok", "netto"));
+    const zmienWidok = (w) => { setWidok(w); lsSet("kreski:widok", w); };
     // Co dokładnie zostało: piwa liczymy w sztukach, rozlewane w mililitrach.
     const opisZapasu = [zapasSztuk > 0 ? piwa(zapasSztuk) : null, mlZostalo > 0 ? mlZostalo + " ml w butelkach" : null]
         .filter(Boolean).join(" i ");
@@ -1260,11 +1295,22 @@ function Rozliczenie({ calc, mode, setMode, colorOf, room, pours, resetPours }) 
             ...(nierozliczone > 0.01 ? ["Zostało alkoholu za " + zl(nierozliczone) + (opisZapasu ? " (" + opisZapasu + ")" : "")] : []), ""];
         rows.forEach((r) => L.push(r.name + (r.tytul ? " (" + r.tytul + ")" : "") + ": " + opis(r.mlRozlane, r.sztuki) + " — " + zl(r.owed)
             + (r.paid > 0 ? " (wyłożył " + zl(r.paid) + (r.zapas > 0.005 ? ", zapas " + zl(r.zapas) : "") + ")" : "")));
-        L.push("", "Kto komu:");
-        if (transfers.length)
-            transfers.forEach((t) => L.push(t.from + " → " + t.to + ": " + zl(t.v)));
-        else
-            L.push("nikt nikomu nic");
+        if (widok === "wprost") {
+            L.push("", "Kto komu (wprost do właściciela):");
+            if (!wprost.length)
+                L.push("nikt nikomu nic");
+            wprost.forEach((g) => {
+                L.push("  do " + g.name + " — razem " + zl(g.suma));
+                g.lista.forEach((t) => L.push("    " + t.from + ": " + zl(t.v)));
+            });
+        }
+        else {
+            L.push("", "Kto komu (najmniej przelewów):");
+            if (transfers.length)
+                transfers.forEach((t) => L.push(t.from + " → " + t.to + ": " + zl(t.v)));
+            else
+                L.push("nikt nikomu nic");
+        }
         return L.join("\n");
     };
     const copy = async () => {
@@ -1320,14 +1366,33 @@ function Rozliczenie({ calc, mode, setMode, colorOf, room, pours, resetPours }) 
                     r.zapas > 0.005 ? ", w tym " + zl(r.zapas) + " nietkniętego zapasu" : "")))),
             !rows.length && React.createElement("div", { style: S.empty }, "Jeszcze nikogo tu nie ma.")),
         React.createElement("h2", { style: S.h2 }, "Kto komu oddaje"),
-        React.createElement("div", { style: { display: "grid", gap: 8 } },
-            transfers.map((t, i) => (React.createElement("div", { key: i, style: { ...S.card, display: "flex", justifyContent: "space-between", alignItems: "center" } },
+        React.createElement("div", { style: { display: "flex", gap: 8, marginBottom: 10 } }, [["netto", "najmniej przelewów"], ["wprost", "wprost do właściciela"]].map(([k, label]) => {
+            const on = widok === k;
+            return (React.createElement("button", { key: k, onClick: () => zmienWidok(k), style: { ...S.chip, flex: 1, fontSize: 13, padding: "9px 6px", background: on ? C.goldDim : "transparent", borderColor: on ? C.gold : C.line, color: on ? C.gold : C.dim, fontWeight: on ? 600 : 400 } }, label));
+        })),
+        React.createElement("p", { style: { fontSize: 13, color: C.dim, margin: "0 0 10px", lineHeight: 1.55 } }, widok === "wprost"
+            ? "Każdy płaci temu, czyj alkohol wypił. Więcej przelewów, za to przy każdym widać powód."
+            : "Długi się skracają: kto był winien kilku osobom, płaci jedną kwotą. Ta sama kasa, najmniej przelewów."),
+        React.createElement("div", { style: { display: "grid", gap: 8 } }, widok === "wprost"
+            ? wprost.map((g) => (React.createElement(React.Fragment, { key: g.id },
+                React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10, padding: "6px 2px 0" } },
+                    React.createElement("span", { style: { fontSize: 12, color: C.dim, letterSpacing: "0.04em" } },
+                        "dla ",
+                        React.createElement("span", { style: { color: colorOf(g.id), fontWeight: 600 } }, g.name)),
+                    React.createElement("span", { style: { fontSize: 14, fontWeight: 700, fontVariantNumeric: "tabular-nums" } }, zl(g.suma))),
+                g.lista.map((t, i) => (React.createElement("div", { key: i, style: { ...S.card, display: "flex", justifyContent: "space-between", alignItems: "center" } },
+                    React.createElement("div", { style: { fontSize: 15 } },
+                        React.createElement("span", { style: { fontWeight: 600, color: colorOf(t.fromId) } }, t.from),
+                        React.createElement("span", { style: { color: C.dim } }, " oddaje "),
+                        React.createElement("span", { style: { fontWeight: 600, color: colorOf(t.toId) } }, t.to)),
+                    React.createElement("div", { style: { fontWeight: 700, fontVariantNumeric: "tabular-nums" } }, zl(t.v))))))))
+            : transfers.map((t, i) => (React.createElement("div", { key: i, style: { ...S.card, display: "flex", justifyContent: "space-between", alignItems: "center" } },
                 React.createElement("div", { style: { fontSize: 15 } },
                     React.createElement("span", { style: { fontWeight: 600, color: colorOf(t.fromId) } }, t.from),
                     React.createElement("span", { style: { color: C.dim } }, " oddaje "),
                     React.createElement("span", { style: { fontWeight: 600, color: colorOf(t.toId) } }, t.to)),
-                React.createElement("div", { style: { fontWeight: 700, fontVariantNumeric: "tabular-nums" } }, zl(t.v))))),
-            !transfers.length && React.createElement("div", { style: S.empty }, "Nikt nikomu nic nie jest winien.")),
+                React.createElement("div", { style: { fontWeight: 700, fontVariantNumeric: "tabular-nums" } }, zl(t.v)))))),
+        !(widok === "wprost" ? wprost.length : transfers.length) && React.createElement("div", { style: S.empty }, "Nikt nikomu nic nie jest winien."),
         React.createElement("button", { onClick: copy, style: { ...S.primary, width: "100%", marginTop: 16, background: copied === true ? C.mint : C.gold } }, copied === true ? "Skopiowane" : copied === "err" ? "Nie udało się skopiować" : "Kopiuj podsumowanie"),
         !!pours.length && (React.createElement("div", { style: { marginTop: 22, textAlign: "center" } }, confirm ? (React.createElement("div", { style: { ...S.card, textAlign: "left" } },
             React.createElement("div", { style: { fontSize: 14, lineHeight: 1.5 } }, "Skasowa\u0107 wszystkie kreski? Osoby i butelki zostan\u0105. Tego nie da si\u0119 cofn\u0105\u0107."),
